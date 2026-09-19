@@ -18,6 +18,10 @@
   兼容无版本号的旧日志（裸卡牌 id）；回放全程只读隔离——不写存档、战败不发解锁
 - 服务端对无限连锁触发设上限防止死循环；领奖/锻造防重复（重复领取返回 409，不重复扣款）
 - 旧存档自动兼容：裸 id 牌组在首次载入（续局/行动）时迁移为卡牌实例结构，含战斗中存档
+- **并发一致性**：每个行动的「校验 → 存档 → 动作日志 → 战败解锁」在单个 SQLite 事务
+  （`BEGIN IMMEDIATE` + WAL）内原子提交，任一写入失败整体回滚，杜绝写入失败/并发操作导致的
+  存档与回放分叉；per-run 锁串行化同一局的读改写，乐观版本号 `rev` 检测状态冲突（409），
+  请求令牌 `request_id` 做请求级幂等（双击/超时重试不重复扣款发奖）；异常/损坏日志不拖垮回放
 
 ## 目录结构
 ```
@@ -52,12 +56,16 @@ py -m pytest -q tests
 失败解锁、种子+动作日志确定性回放、**可交互回放逐帧重建（帧视口/规则版本/校验点/损坏检出/旧日志兼容/只读隔离与解锁隔离）**、
 锻造同名卡独立成长、锻造贯通战斗/奖励/续局/回放、旧档迁移、
 商店库存确定性/续局一致、购买卡牌/遗物（扣款/售罄/失败回退）、移除指定实例（递增价/牌组下限）、
-交易贯通后续战斗与回放。
+交易贯通后续战斗与回放、**并发与原子提交（写入失败整体回滚、并发领奖/锻造/战败只生效一次、
+request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema 自动迁移、损坏日志/序号缺口容错）**。
 
 ## API 摘要
 - `POST /api/runs {seed?}` 建局
 - `GET  /api/runs/{id}/resume` 续局
 - `POST /api/runs/{id}/act {action,...}` 行动（choose_node / play / end_turn / claim_reward / forge / shop_buy / shop_remove）
+  - 可选并发字段：`request_id`（客户端为每个意图生成的令牌；同令牌重复/并发提交返回首次响应，
+    响应里 `duplicate:true`，绝不重复执行）、`expected_rev`（所依据视口的存档版本号；
+    存档已被推进则返回 409 状态冲突）。行动响应与 `/resume` 视口携带当前 `rev`。
 - `GET  /api/runs/{id}/replay` 整局可交互回放：除原 `actions`（兼容）外，返回
   `rules_version` / `recorded_versions` / `legacy` / `initial.checkpoint` / `steps[]` /
   `final_view` / `verification` / `isolated`；每个 `step` 含动作、类型/标题/摘要、
@@ -97,5 +105,13 @@ py -m pytest -q tests
   引擎在打牌时用 `forging.effective_card(base, forges)` 即时换算生效卡牌（费用/数值），
   因此锻造/商店购卡/商店移除自动贯通战斗结算、续局与回放（初始牌组 7 张，商店可增减）。
 - 旧档兼容：缺少 `card_instances` 的存档在首次载入时迁移；战斗中存档按三堆出现序把裸 id
-  稳定映射到 uid，洗牌布局与确定性保持不变。
-- SQLite：`runs`（状态，含商店库存/交易记录）、`battle_events`（动作日志，含 forge/shop 行）、`profile`（解锁卡）。
+  稳定映射到 uid，洗牌布局与确定性保持不变。迁移发生在已存在的动作上，该步事件带
+  `migrated:true`，回放按 legacy 处理本步校验点（结构迁移天然不可逐位比较），后续步骤仍严格校验。
+- **原子提交与并发**：`db.transaction()` 经共享单连接开启 `BEGIN IMMEDIATE`，行动事务内
+  顺序写 runs（`rev=rev+1` 乐观锁）→ battle_events → profile → act_requests，异常即 rollback；
+  per-run `threading.RLock` 在进程内串行同一局，WAL + busy_timeout 让读写不互斥。
+  旧库启动自动补 `rev` 列与 `act_requests` 表。损坏的 `payload_json`（非法 JSON/NULL）
+  在读取时降级为 `_corrupt` 行，回放标注 `error` 仍可播放其余步骤；序号缺口给出 `warning`
+  与 `verification.seq_gaps`。
+- SQLite：`runs`（状态，含 rev 乐观版本、商店库存/交易记录）、`battle_events`（动作日志，
+  含 forge/shop 行）、`profile`（解锁卡）、`act_requests`（request_id → 首次响应，请求级幂等）。

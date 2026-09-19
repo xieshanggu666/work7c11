@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react'
-import { api } from '../api'
+import { api, handleActError } from '../api'
 import { useStore } from '../store'
 
 const TYPE_LABEL = { attack: '攻击', skill: '技能', power: '能力' }
@@ -31,7 +31,7 @@ export default function ShopView({ view, onClose }) {
       applyRun(res.run)
       setSelected(null)
     } catch (e) {
-      setErr(e.message)
+      setErr(await handleActError(e, runId, applyRun))
     } finally {
       setBusy(false)
     }

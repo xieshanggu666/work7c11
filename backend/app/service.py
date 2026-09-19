@@ -132,11 +132,13 @@ def create_run(seed=None):
     run_id = uuid.uuid4().hex[:12]
     state = _new_run_state(seed)
     map_data = mapgen.generate_map(seed)
-    db.insert_run(run_id, state["seed"], state["status"], state["position"], map_data, state)
-    db.append_event(run_id, 1, "create", {
-        "seed": state["seed"], "ver": RULES_VERSION, "ckpt": state_checkpoint(state),
-    })
-    return _public_view(state, map_data, run_id)
+    # 建局：存档与首条动作日志在同一事务，任何写入失败都不会留下“无日志的局”
+    with db.transaction() as conn:
+        db.insert_run(conn, run_id, state["seed"], state["status"], state["position"], map_data, state)
+        db.append_event_conn(conn, run_id, 1, "create", {
+            "seed": state["seed"], "ver": RULES_VERSION, "ckpt": state_checkpoint(state),
+        })
+    return _public_view(state, map_data, run_id, rev=1)
 
 
 def load_run(run_id):
@@ -186,34 +188,89 @@ def _load_battle(run_state):
 
 
 # ---------- 行动 ----------
+class StaleState(Exception):
+    """客户端携带的状态版本已过期（基于旧视口提交），要求刷新后重试 -> 409。"""
+    pass
+
+
 def act(run_id, action):
-    """在线行动：校验 -> 纯状态推演（无 DB）-> 落库 + 追加动作日志。
+    """在线行动：加锁 -> 校验/幂等 -> 纯状态推演（无 DB）-> 单事务原子提交。
 
     纯推演部分（_apply_action）与回放共享同一条代码路径，保证“玩的时候”
-    和“回放重建”永远使用同一套规则；只有本函数允许写 runs / battle_events / profile。
+    和“回放重建”永远使用同一套规则。提交时 存档 + 动作日志 + 战败解锁 在同一
+    个 SQLite 事务里：任何写入失败整体回滚，不会出现存档推进了但日志缺行
+    （或日志有行但存档没动）的存档/回放分叉。
+
+    并发与重复：
+    - per-run 锁串行化同一局的读改写，双击/并发的两个请求只会有一个生效，
+      另一个看到的是推进后的状态（由业务幂等键 reward_claimed/forge_claimed/
+      售罄等判为 409，或直接基于新状态合法执行）；
+    - 客户端可带 request_id 做请求级幂等：重复请求原样返回首次响应，不重复
+      扣款/不重复发奖；
+    - 可携带 expected_rev（视口版本）基于旧状态提交时返回 409 状态冲突。
     """
-    rec = load_run(run_id)
-    if rec is None:
-        raise InvalidAction("run not found")
-    run = rec["state"]
-    map_data = rec["map"]
-    # 旧档兼容：首次载入即迁移到卡牌实例结构（随本次行动结果一起落库）
-    _migrate_state(run)
-    if run["status"] != "in_progress":
-        raise InvalidAction(f"run already ended ({run['status']})")
-
+    request_id = action.get("request_id")
+    expected_rev = action.get("expected_rev")
     a = action.get("action")
-    log = _apply_action(run, a, action, map_data, grant_unlocks=True)
 
-    db.save_run(run_id, run["status"], run["position"], run)
-    seq = db.next_seq(run_id)
-    db.append_event(run_id, seq, a, {
-        "node": action.get("node"), "card": action.get("card"),
-        "option": action.get("option"), "branch": action.get("branch"),
-        "kind": action.get("kind"), "sku": action.get("sku"),
-        "ver": RULES_VERSION, "ckpt": state_checkpoint(run),
-    })
-    return {"seq": seq, "log": log, "run": _public_view(run, map_data, run_id)}
+    with db.run_lock(run_id):
+        with db.transaction() as conn:
+            # 幂等命中：重复请求直接回放首次响应（同一 run 锁内，结果确定）
+            prior = db.get_idempotent(conn, run_id, request_id)
+            if prior is not None:
+                # 重复请求：返回首次响应的副本并标注 duplicate，不改存的幂等记录
+                cached = dict(prior["response"])
+                cached["duplicate"] = True
+                return cached
+
+            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                raise InvalidAction("run not found")
+            rec = {
+                "id": row["id"], "seed": row["seed"], "status": row["status"],
+                "position": row["position"], "map": json.loads(row["map_json"]),
+                "state": json.loads(row["state_json"]), "rev": row["rev"],
+            }
+            if expected_rev is not None and expected_rev != rec["rev"]:
+                raise StaleState(f"state version conflict: expected {expected_rev}, actual {rec['rev']}")
+
+            run = rec["state"]
+            map_data = rec["map"]
+            # 旧档兼容：首次载入即迁移到卡牌实例结构（随本次行动结果一起原子落库）。
+            # migrated=True 时本步状态结构与回放起点（已是新结构）不同，校验点天然
+            # 不可比，事件打 migrated 标记 -> 回放按 legacy 处理本步，后续步骤仍严格校验。
+            migrated = _migrate_state(run)
+            if run["status"] != "in_progress":
+                raise InvalidAction(f"run already ended ({run['status']})")
+
+            # 纯推演：不触碰数据库；失败抛异常 -> 事务回滚，零副作用
+            log = _apply_action(run, a, action, map_data, grant_unlocks=True)
+            pending_unlock = run.pop(_PENDING_UNLOCK_KEY, None)
+
+            payload = {
+                "node": action.get("node"), "card": action.get("card"),
+                "option": action.get("option"), "branch": action.get("branch"),
+                "kind": action.get("kind"), "sku": action.get("sku"),
+                "ver": RULES_VERSION, "ckpt": state_checkpoint(run),
+            }
+            if migrated:
+                payload["migrated"] = True
+            # 存档推进 + 日志追加 + 解锁发放：同生共死
+            try:
+                db.save_run_run(conn, run_id, run["status"], run["position"], run,
+                                expected_rev=rec["rev"])
+            except db.ConcurrentModification as e:
+                # 多进程部署下存档在本事务期间被别处推进：按状态冲突处理（回滚 -> 409）
+                raise StaleState(str(e))
+            seq = db.next_seq_conn(conn, run_id)
+            db.append_event_conn(conn, run_id, seq, a, payload)
+            if pending_unlock is not None:
+                db.upsert_profile_conn(conn, pending_unlock)
+
+            response = {"seq": seq, "log": log, "run": _public_view(run, map_data, run_id),
+                        "rev": rec["rev"] + 1, "duplicate": False}
+            db.put_idempotent(conn, run_id, request_id, seq, response)
+            return response
 
 
 def _apply_action(run, a, action, map_data, grant_unlocks=False):
@@ -325,7 +382,6 @@ def _play(run, card_ref, grant_unlocks=True):
         raise InvalidAction(str(e))
     return _after_battle_step(run, battle, log, grant_unlocks)
 
-
 def _resolve_hand_ref(run, battle, ref):
     """动作里的卡牌引用 -> 手牌引用。
 
@@ -389,9 +445,11 @@ def _after_battle_step(run, battle, log, grant_unlocks=True):
         run["battle"] = None
         run["status"] = "lost"
         log.append({"result": "lost", "snapshot": snap})
-        # 仅在线路径发放失败解锁；回放/模拟（grant_unlocks=False）不写 profile
+        # 仅在线路径计算失败解锁；回放/模拟（grant_unlocks=False）不产生 profile 变更
         if grant_unlocks:
-            _grant_unlock_on_loss(run)
+            new_profile, changed = _grant_unlock_on_loss(run)
+            if changed:
+                run[_PENDING_UNLOCK_KEY] = new_profile
     return log
 
 
@@ -556,17 +614,22 @@ def _shop_remove(run, card_uid):
 
 
 def _grant_unlock_on_loss(run):
+    """在线战败：纯计算本次解锁结果（不写库）。
+
+    返回 (新 profile, 是否有变化)；由 act 的原子事务与存档/日志一起提交。
+    回放路径（grant_unlocks=False）不会调用本函数。
+    """
     prof = db.get_profile()
     unlocked = list(prof["unlocked"]) if prof else list(START_DECK)
     locked = list(prof["locked"]) if prof else list(INIT_LOCKED)
     pool = [c for c in locked if all_cards_locked().get(c)]
     if not pool:
-        return
+        return None, False
     rng = random.Random(run["seed"] + run["battle_index"])
     cid = pool[rng.randrange(len(pool))]
     unlocked.append(cid)
     locked.remove(cid)
-    db.upsert_profile({"unlocked": unlocked, "locked": locked})
+    return {"unlocked": unlocked, "locked": locked}, True
 
 
 def all_cards_locked():
@@ -575,18 +638,32 @@ def all_cards_locked():
 
 # ---------- 视口 ----------
 def resume(run_id):
-    rec = load_run(run_id)
-    if rec is None:
-        raise InvalidAction("run not found")
-    # 旧档兼容：续局时迁移并落库，之后所有战斗/锻造都走卡牌实例
-    if _migrate_state(rec["state"]):
-        db.save_run(run_id, rec["state"]["status"], rec["state"]["position"], rec["state"])
-    return _public_view(rec["state"], rec["map"], rec["id"])
+    # 旧档兼容迁移与读改写同一把锁/事务：并发续局或“续局与首行动撞车”时
+    # 不会发生两次迁移互相覆盖（迁移结果与日志一起原子落库）。
+    with db.run_lock(run_id):
+        with db.transaction() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                raise InvalidAction("run not found")
+            state = json.loads(row["state_json"])
+            map_data = json.loads(row["map_json"])
+            if _migrate_state(state):
+                # 迁移是幂等的结构升级：无条件落库即可（per-run 锁已串行化，
+                # 多进程下即便并发迁移，写入的也是等价结构），不做 rev 冲突判定。
+                db.save_run_run(conn, run_id, row["status"], row["position"], state)
+                rev = row["rev"] + 1
+            else:
+                rev = row["rev"]
+            return _public_view(state, map_data, run_id, rev=rev)
 
 
 # ---------- 规则版本与校验点 ----------
-# 不参与状态校验的瞬时/派生字段：events_log 只用于事件叙述，不影响规则推演
-_CKPT_SKIP_KEYS = {"events_log"}
+# 不参与状态校验的瞬时/派生字段：
+# - events_log 只用于事件叙述，不影响规则推演
+# - _pending_unlock 是在线行动在内存中暂存的战败解锁，随事务提交到 profile，
+#   不属于 run 状态本身（绝不写入 state_json）
+_PENDING_UNLOCK_KEY = "_pending_unlock"
+_CKPT_SKIP_KEYS = {"events_log", _PENDING_UNLOCK_KEY}
 
 
 def state_checkpoint(run):
@@ -618,6 +695,7 @@ def replay(run_id):
         raise InvalidAction("run not found")
     seed = rec["state"]["seed"]
     map_data = rec["map"]
+    # 只读已持久化日志：经共享连接读取，保证读到的都是已提交事务
     events = db.load_events(run_id)
 
     # 回放起点：重新构造建局时的初始状态（不读、不写、不迁移真实存档）
@@ -629,20 +707,36 @@ def replay(run_id):
     legacy_steps = 0
     skipped_errors = 0
     versions = set()
+    expected_seq = 1     # 序号连续性检查（旧档/异常日志可能有缺口）
+    gap_steps = 0
 
     for ev in events:
-        ver = (ev.get("payload") or {}).get("ver")
+        payload = ev.get("payload") or {}
+        corrupt_row = bool(payload.get("_corrupt"))
+        # 旧档迁移步：状态从旧结构迁到新结构，与回放起点（已为新结构）的校验点
+        # 天然不可逐位比较。正常推演但本步跳过哈希校验，按 legacy 呈现。
+        migrated_step = bool(payload.get("migrated")) and not corrupt_row
+        ver = payload.get("ver") if not corrupt_row else None
         if ver:
             versions.add(ver)
+        # 损坏行没有可信版本号，按旧日志处理但仍会因推演失败标注 error
         is_legacy = not ver
-        if is_legacy:
+        if is_legacy or migrated_step:
             legacy_steps += 1
-        recorded = (ev.get("payload") or {}).get("ckpt")
+        recorded = None if (corrupt_row or migrated_step) else payload.get("ckpt")
         a = ev["action"]
-        payload = ev.get("payload") or {}
+        # 序号缺口不阻断后续推演（可能是旧档缺行），但记录警告便于排障
+        gap_warning = None
+        if ev["seq"] != expected_seq:
+            gap_warning = f"seq gap: expected {expected_seq}, found {ev['seq']}"
+            gap_steps += 1
+        expected_seq = ev["seq"] + 1
 
         log, error = [], None
-        if a == "create":
+        if corrupt_row:
+            error = "CorruptLog: 动作日志载荷损坏，无法重演该步"
+            skipped_errors += 1
+        elif a == "create":
             # 建局事件只携带种子；初始状态已在循环外构造，不产生状态变化
             pass
         else:
@@ -678,8 +772,10 @@ def replay(run_id):
             "result": _step_result(log),
             "view": _public_view(sim, map_data, run_id, include_unlocks=False),
             "check": status,
-            "legacy": is_legacy,
+            "legacy": is_legacy or migrated_step,
+            "migrated": migrated_step,
             "error": error,
+            "warning": gap_warning,
         })
 
     recorded_versions = sorted(versions)
@@ -702,6 +798,7 @@ def replay(run_id):
             "legacy": sum(c["status"] == "legacy" for c in checks),
             "mismatch": sum(c["status"] == "mismatch" for c in checks),
             "error": sum(c["status"] == "error" for c in checks),
+            "seq_gaps": gap_steps,
             "final_match": final_match,
             "checks": checks,
             "skipped_errors": skipped_errors,
@@ -830,8 +927,11 @@ def _hand_public(run, bstate):
     return out
 
 
-def _public_view(run, map_data, run_id, include_unlocks=True):
-    """只读视口。include_unlocks=False（回放）时不读取 profile 库，省略解锁信息。"""
+def _public_view(run, map_data, run_id, include_unlocks=True, rev=None):
+    """只读视口。include_unlocks=False（回放）时不读取 profile 库，省略解锁信息。
+
+    rev 非 None 时附带存档乐观版本号，客户端下次行动可作为 expected_rev 回传。
+    """
     reachable = map_data["routes"].get(run["position"], [])
     snap = None
     if run["in_battle"] and run["battle"]:
@@ -860,7 +960,7 @@ def _public_view(run, map_data, run_id, include_unlocks=True):
         "forges": list(instances[uid].get("forges", [])),
     } for uid in run["deck"] if uid in instances] or list(run["deck"])
     node_data = map_data["nodes"].get(run["position"], {})
-    return {
+    view = {
         "run_id": run_id,
         "seed": run["seed"],
         "status": run["status"],
@@ -886,6 +986,9 @@ def _public_view(run, map_data, run_id, include_unlocks=True):
         "unlocked_cards": get_profile_unlocked() if include_unlocks else None,
         "truncated": bool(run["battle"]["truncated"]) if run["in_battle"] and run["battle"] else bool(run.get("truncated", False)),
     }
+    if rev is not None:
+        view["rev"] = rev
+    return view
 
 
 def _map_public(map_data, position):

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { api } from '../api'
+import { api, handleActError } from '../api'
 import { useStore } from '../store'
 import { bus } from '../phaser/battleBus'
 import { startPhaser, STATUS_ZH } from '../phaser/BattleScene.js'
@@ -67,7 +67,7 @@ export default function BattleView({ view }) {
       await playLog(entries)
       applyRun(res.run)
     } catch (e) {
-      setErr(e.message)
+      setErr(await handleActError(e, runId, applyRun))
     } finally {
       setBusy(false)
     }

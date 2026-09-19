@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react'
-import { api } from '../api'
+import { api, handleActError } from '../api'
 import { useStore } from '../store'
 
 const BRANCH_TAG = { sharpen: '锋', empower: '强', refine: '炼' }
@@ -31,7 +31,7 @@ export default function ForgeView({ view }) {
       applyRun(res.run)
       setSelected(null)
     } catch (e) {
-      setErr(e.message)
+      setErr(await handleActError(e, runId, applyRun))
     } finally {
       setBusy(false)
     }

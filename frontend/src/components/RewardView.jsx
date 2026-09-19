@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { api } from '../api'
+import { api, handleActError } from '../api'
 import { useStore } from '../store'
 
 export default function RewardView({ view }) {
@@ -14,7 +14,7 @@ export default function RewardView({ view }) {
       const res = await api.act(runId, { action: 'claim_reward', option: idx })
       applyRun(res.run)
     } catch (e) {
-      setErr(e.message)
+      setErr(await handleActError(e, runId, applyRun))
     } finally {
       setBusy(false)
     }

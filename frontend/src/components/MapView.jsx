@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { api } from '../api'
+import { api, handleActError } from '../api'
 import { useStore } from '../store'
 
 const TYPE_LABEL = {
@@ -28,7 +28,7 @@ export default function MapView({ view }) {
       const res = await api.act(runId, { action: 'choose_node', node })
       applyRun(res.run)
     } catch (e) {
-      setErr(e.message)
+      setErr(await handleActError(e, runId, applyRun))
     } finally {
       setBusy(false)
     }
