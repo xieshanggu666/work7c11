@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+backend/data/
+backend/.pytest_cache/
+.env
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# 其他
+.DS_Store
+.vscode/
