@@ -1,5 +1,4 @@
 import React, { useMemo, useState } from 'react'
-import { api } from '../api'
 import { useStore } from '../store'
 
 const TYPE_LABEL = { attack: '攻击', skill: '技能', power: '能力' }
@@ -11,8 +10,8 @@ export default function ShopView({ view, onClose }) {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
   const [selected, setSelected] = useState(null) // 待移除的卡牌实例 uid
-  const runId = useStore((s) => s.runId)
   const applyRun = useStore((s) => s.applyRun)
+  const submitAction = useStore((s) => s.submitAction)
   const cardMeta = useStore((s) => s.cardMeta)
 
   const shop = view.shop
@@ -27,7 +26,7 @@ export default function ShopView({ view, onClose }) {
   async function transact(body) {
     setBusy(true); setErr('')
     try {
-      const res = await api.act(runId, body)
+      const res = await submitAction(body)
       applyRun(res.run)
       setSelected(null)
     } catch (e) {

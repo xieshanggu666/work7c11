@@ -1,5 +1,4 @@
 import React, { useState } from 'react'
-import { api } from '../api'
 import { useStore } from '../store'
 
 const TYPE_LABEL = {
@@ -16,7 +15,7 @@ const TYPE_LABEL = {
 export default function MapView({ view }) {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
-  const runId = useStore((s) => s.runId)
+  const submitAction = useStore((s) => s.submitAction)
   const applyRun = useStore((s) => s.applyRun)
 
   const m = view.map
@@ -25,7 +24,7 @@ export default function MapView({ view }) {
   async function go(node) {
     setBusy(true); setErr('')
     try {
-      const res = await api.act(runId, { action: 'choose_node', node })
+      const res = await submitAction({ action: 'choose_node', node })
       applyRun(res.run)
     } catch (e) {
       setErr(e.message)

@@ -22,6 +22,8 @@ def get_run(run_id: str):
         return service.resume(run_id)
     except service.InvalidAction as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except service.StateConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 @router.post("/{run_id}/act")
@@ -32,13 +34,19 @@ def act(run_id: str, body: ActRequest):
         raise HTTPException(status_code=409, detail=str(e))
     except service.ShopSoldOut as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except service.StateConflict as e:
+        # 存档已被并发请求/进程推进：客户端应以最新 /resume 视口为准后重试
+        raise HTTPException(status_code=409, detail=str(e))
     except service.InvalidAction as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/{run_id}/resume")
 def resume(run_id: str):
-    return service.resume(run_id)
+    try:
+        return service.resume(run_id)
+    except service.StateConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 @router.get("/{run_id}/replay")

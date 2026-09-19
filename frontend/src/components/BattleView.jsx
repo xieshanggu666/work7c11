@@ -1,5 +1,4 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { api } from '../api'
 import { useStore } from '../store'
 import { bus } from '../phaser/battleBus'
 import { startPhaser, STATUS_ZH } from '../phaser/BattleScene.js'
@@ -11,8 +10,8 @@ export default function BattleView({ view }) {
   viewRef.current = view
   const [busy, setBusy] = useState(false)
   const [log, setLog] = useState([])
-  const runId = useStore((s) => s.runId)
   const applyRun = useStore((s) => s.applyRun)
+  const submitAction = useStore((s) => s.submitAction)
   const cardMeta = useStore((s) => s.cardMeta)
   const [err, setErr] = useState('')
 
@@ -59,7 +58,7 @@ export default function BattleView({ view }) {
     if (busy) return
     setBusy(true); setErr('')
     try {
-      const res = await api.act(runId, { action, ...extra })
+      const res = await submitAction({ action, ...extra })
       const entries = res.log || []
       setLog(entries)
       // 动画期间操作锁定（busy），播完再应用权威状态：

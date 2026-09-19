@@ -13,9 +13,17 @@
   播放期间操作锁定，播完再应用权威快照同步血量/护盾/手牌，战斗结束衔接领奖
 - 服务端权威校验行动，防作弊；失败解锁新卡
 - 中途可续局（`POST /api/runs` → 刷新 → 回到同一节点/战斗）；种子回放一致
+- **原子提交与并发一致**：每个行动在单条 `BEGIN IMMEDIATE` 事务内完成
+  「行动校验/推演 → 存档 CAS 更新（runs.revision 乐观锁）→ 动作日志追加 → 战败解锁 → 幂等记录」，
+  任一步失败整体回滚，杜绝“存档已变、日志缺行/奖励半发”的存档与回放分叉；
+  同局并发请求由进程内串行锁排队，跨进程/多实例由 revision 乐观锁拦截（409，不覆盖他人结果），
+  客户端收 409 自动拉 `/resume` 同步最新状态
+- **请求幂等**：`act` 携带 `req_id` 令牌，双击/网络重发命中首次响应（`duplicate:true`），不重复生效/扣款；
+  前端同一逻辑操作的网络重试复用同一令牌
 - **可交互整局回放**：动作日志升级为可 ▶播放 / ⏸暂停 / ◀单步 / 拖拽跳转 / 0.5–4× 倍速 的时间轴，
   逐步重建路线、战斗（Phaser 按结算顺序重演）、锻造与交易状态；记录规则版本与逐步校验点（可检出日志损坏/规则漂移），
-  兼容无版本号的旧日志（裸卡牌 id）；回放全程只读隔离——不写存档、战败不发解锁
+  兼容无版本号的旧日志（裸卡牌 id）与**损坏日志行**（非法 JSON 标为 error 帧、不拖垮整段回放）；
+  回放全程只读隔离——不写存档、战败不发解锁
 - 服务端对无限连锁触发设上限防止死循环；领奖/锻造防重复（重复领取返回 409，不重复扣款）
 - 旧存档自动兼容：裸 id 牌组在首次载入（续局/行动）时迁移为卡牌实例结构，含战斗中存档
 
@@ -50,6 +58,8 @@ py -m pytest -q tests
 ```
 测试覆盖：结算队列（连锁/叠加/死亡打断）、无限连锁封顶、防重复领奖/锻造（含重复扣款）、
 失败解锁、种子+动作日志确定性回放、**可交互回放逐帧重建（帧视口/规则版本/校验点/损坏检出/旧日志兼容/只读隔离与解锁隔离）**、
+**原子提交与并发（并发行动串行化后存档/日志一致、req_id 幂等回放、写日志失败整体回滚含解锁、
+revision 乐观锁 409、旧库 revision 列自动升级、损坏日志行回放隔离）**、
 锻造同名卡独立成长、锻造贯通战斗/奖励/续局/回放、旧档迁移、
 商店库存确定性/续局一致、购买卡牌/遗物（扣款/售罄/失败回退）、移除指定实例（递增价/牌组下限）、
 交易贯通后续战斗与回放。
@@ -57,7 +67,8 @@ py -m pytest -q tests
 ## API 摘要
 - `POST /api/runs {seed?}` 建局
 - `GET  /api/runs/{id}/resume` 续局
-- `POST /api/runs/{id}/act {action,...}` 行动（choose_node / play / end_turn / claim_reward / forge / shop_buy / shop_remove）
+- `POST /api/runs/{id}/act {action,...}` 行动（choose_node / play / end_turn / claim_reward / forge / shop_buy / shop_remove；
+  可选 `req_id` 幂等令牌：同值重试返回首次结果并带 `duplicate:true`）
 - `GET  /api/runs/{id}/replay` 整局可交互回放：除原 `actions`（兼容）外，返回
   `rules_version` / `recorded_versions` / `legacy` / `initial.checkpoint` / `steps[]` /
   `final_view` / `verification` / `isolated`；每个 `step` 含动作、类型/标题/摘要、
@@ -98,4 +109,8 @@ py -m pytest -q tests
   因此锻造/商店购卡/商店移除自动贯通战斗结算、续局与回放（初始牌组 7 张，商店可增减）。
 - 旧档兼容：缺少 `card_instances` 的存档在首次载入时迁移；战斗中存档按三堆出现序把裸 id
   稳定映射到 uid，洗牌布局与确定性保持不变。
-- SQLite：`runs`（状态，含商店库存/交易记录）、`battle_events`（动作日志，含 forge/shop 行）、`profile`（解锁卡）。
+- SQLite：`runs`（状态，含商店库存/交易记录与 `revision` 乐观锁版本）、
+  `battle_events`（动作日志，含 forge/shop 行）、`profile`（解锁卡）、
+  `idempotent_requests`（(run_id, req_id) → 首次响应，重复请求回放）。
+  写路径统一走 `db.transaction()`（BEGIN IMMEDIATE）：行动的存档/日志/解锁/幂等记录同事务提交。
+  旧库启动时自动补 `revision` 列；单条日志 payload 损坏（非法 JSON）不影响其余日志读取与回放。
